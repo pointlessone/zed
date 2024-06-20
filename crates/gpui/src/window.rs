@@ -621,6 +621,7 @@ impl Window {
             display_id,
             window_background,
             app_id,
+            window_decorations,
         } = options;
 
         let bounds = window_bounds
@@ -652,6 +653,9 @@ impl Window {
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let last_input_timestamp = Rc::new(Cell::new(Instant::now()));
+
+        platform_window
+            .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
 
         if let Some(ref window_open_state) = window_bounds {
             match window_open_state {
@@ -971,8 +975,8 @@ impl<'a> WindowContext<'a> {
     }
 
     /// Check if the platform window is current tiled
-    pub fn is_tiled(&self) -> bool {
-        self.window.platform_window.is_tiled()
+    pub fn tiling(&self) -> crate::Tiling {
+        self.window.platform_window.tiling()
     }
 
     /// request a certain window decoration (Wayland)
