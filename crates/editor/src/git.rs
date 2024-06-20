@@ -1,4 +1,5 @@
 pub mod blame;
+pub mod project_diff;
 
 use std::ops::Range;
 
