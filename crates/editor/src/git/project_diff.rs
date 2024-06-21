@@ -1,18 +1,17 @@
 use std::{
     any::{Any, TypeId},
-    collections::HashSet,
     time::Duration,
 };
 
 use anyhow::Context as _;
-use collections::{hash_map, HashMap};
+use collections::{hash_map, BTreeMap, HashMap};
 use futures::{stream::FuturesUnordered, StreamExt};
 use git::{diff::DiffHunk, repository::GitFileStatus};
 use gpui::{
     actions, AnyElement, AnyView, AppContext, EventEmitter, FocusHandle, FocusableView,
     InteractiveElement, Model, Render, Subscription, Task, View, WeakModel, WeakView,
 };
-use language::{Buffer, BufferRow};
+use language::{Buffer, BufferRow, BufferSnapshot};
 use multi_buffer::MultiBuffer;
 use project::{Project, ProjectEntryId, ProjectPath, WorktreeId};
 use text::Rope;
@@ -38,9 +37,10 @@ pub fn init(cx: &mut AppContext) {
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(80);
 
 struct ProjectDiffEditor {
-    project_changes: HashMap<WorktreeId, HashMap<ProjectEntryId, ChangedBuffer>>,
-    editor: View<Editor>,
+    buffer_changes: BTreeMap<WorktreeId, HashMap<ProjectEntryId, ChangedBuffer>>,
+    entry_order: HashMap<WorktreeId, Vec<(ProjectPath, ProjectEntryId)>>,
     excerpts: Model<MultiBuffer>,
+    editor: View<Editor>,
 
     project: Model<Project>,
     workspace: WeakView<Workspace>,
@@ -110,16 +110,16 @@ impl ProjectDiffEditor {
                     project::Event::WorktreeAdded(id) => {
                         worktree_to_rescan = Some(*id);
                         project_diff_editor
-                            .project_changes
+                            .buffer_changes
                             .insert(*id, HashMap::default());
                     }
                     project::Event::WorktreeRemoved(id) => {
-                        project_diff_editor.project_changes.remove(id);
+                        project_diff_editor.buffer_changes.remove(id);
                     }
                     project::Event::WorktreeUpdatedEntries(id, updated_entries) => {
                         worktree_to_rescan = Some(*id);
                         let entry_changes =
-                            project_diff_editor.project_changes.entry(*id).or_default();
+                            project_diff_editor.buffer_changes.entry(*id).or_default();
                         for (_, entry_id, change) in updated_entries.iter() {
                             let changes = entry_changes.entry(*entry_id);
                             match change {
@@ -141,15 +141,15 @@ impl ProjectDiffEditor {
                     }
                     project::Event::WorktreeUpdatedGitRepositories(id) => {
                         worktree_to_rescan = Some(*id);
-                        project_diff_editor.project_changes.clear();
+                        project_diff_editor.buffer_changes.clear();
                     }
                     project::Event::DeletedEntry(id, entry_id) => {
-                        if let Some(entries) = project_diff_editor.project_changes.get_mut(id) {
+                        if let Some(entries) = project_diff_editor.buffer_changes.get_mut(id) {
                             entries.remove(entry_id);
                         }
                     }
                     project::Event::Closed => {
-                        project_diff_editor.project_changes.clear();
+                        project_diff_editor.buffer_changes.clear();
                     }
                     _ => {}
                 }
@@ -171,7 +171,8 @@ impl ProjectDiffEditor {
         let mut new_self = Self {
             project,
             workspace,
-            project_changes: HashMap::default(),
+            buffer_changes: BTreeMap::default(),
+            entry_order: HashMap::default(),
             worktree_rescans: HashMap::default(),
             focus_handle,
             editor,
@@ -183,7 +184,7 @@ impl ProjectDiffEditor {
     }
 
     fn schedule_rescan_all(&mut self, cx: &mut ViewContext<Self>) {
-        for worktree in self.project.read(cx).worktrees() {
+        for worktree in self.project.read(cx).worktrees().collect::<Vec<_>>() {
             self.schedule_worktree_rescan(worktree.read(cx).id(), cx);
         }
     }
@@ -253,49 +254,73 @@ impl ProjectDiffEditor {
                     })
                     .await;
 
-                project_diff_editor
-                    .update(&mut cx, |project_diff_editor, cx| {
-                        let mut new_changes =
-                            HashMap::<WorktreeId, HashSet<ProjectEntryId>>::default();
+                let Some((buffers, mut new_entries)) = cx
+                    .update(|cx| {
+                        let mut buffers = BTreeMap::<
+                            WorktreeId,
+                            HashMap<
+                                ProjectEntryId,
+                                (GitFileStatus, Rope, WeakModel<Buffer>, BufferSnapshot),
+                            >,
+                        >::new();
+                        let mut new_entries = Vec::new();
                         for (status, entry_id, entry_path, buffer) in buffers_with_git_diff {
                             let Some(diff_base) = buffer.read(cx).diff_base().cloned() else {
                                 continue;
                             };
-                            new_changes
-                                .entry(entry_path.worktree_id)
-                                .or_default()
-                                .insert(entry_id);
-                            // TODO kb should move off to a background task?
-                            let hunks = buffer
-                                .read(cx)
-                                .snapshot()
-                                .git_diff_hunks_in_row_range(0..BufferRow::MAX)
-                                .collect::<Vec<_>>();
-                            project_diff_editor
-                                .project_changes
-                                .entry(entry_path.worktree_id)
-                                .or_default()
-                                .insert(
+                            buffers.entry(entry_path.worktree_id).or_default().insert(
+                                entry_id,
+                                (
+                                    status,
+                                    diff_base,
+                                    buffer.downgrade(),
+                                    buffer.read(cx).snapshot(),
+                                ),
+                            );
+                            new_entries.push((entry_path, entry_id));
+                        }
+                        (buffers, new_entries)
+                    })
+                    .ok()
+                else {
+                    return;
+                };
+
+                let (new_changes, new_entry_order) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let mut new_changes =
+                            BTreeMap::<WorktreeId, HashMap<ProjectEntryId, ChangedBuffer>>::new();
+                        for (worktree_id, worktree_buffers) in buffers {
+                            for (entry_id, (status, diff_base, buffer, buffer_snapshot)) in
+                                worktree_buffers
+                            {
+                                new_changes.entry(worktree_id).or_default().insert(
                                     entry_id,
                                     ChangedBuffer::Present(Changes {
                                         status,
-                                        buffer: buffer.downgrade(),
                                         diff_base,
-                                        hunks,
+                                        buffer,
+                                        hunks: buffer_snapshot
+                                            .git_diff_hunks_in_row_range(0..BufferRow::MAX)
+                                            .collect::<Vec<_>>(),
                                     }),
                                 );
+                            }
                         }
 
-                        project_diff_editor
-                            .project_changes
-                            .retain(|worktree_id, changes| {
-                                let Some(new_changes) = new_changes.get(worktree_id) else {
-                                    return false;
-                                };
-                                changes.retain(|entry_id, _| new_changes.contains(entry_id));
-                                !changes.is_empty()
-                            });
+                        new_entries.sort_by(|(project_path_a, _), (project_path_b, _)| {
+                            project::compare_paths(
+                                (project_path_a.path.as_ref(), true),
+                                (project_path_b.path.as_ref(), true),
+                            )
+                        });
+                        (new_changes, new_entries)
+                    })
+                    .await;
 
+                project_diff_editor
+                    .update(&mut cx, |project_diff_editor, cx| {
                         // TODO kb now, update the excerpts
                     })
                     .ok();
@@ -333,7 +358,7 @@ impl Item for ProjectDiffEditor {
     }
 
     fn tab_content(&self, params: TabContentParams, _: &WindowContext) -> AnyElement {
-        if self.project_changes.is_empty() {
+        if self.buffer_changes.is_empty() {
             Label::new("No changes")
                 .color(if params.selected {
                     Color::Default
@@ -349,7 +374,7 @@ impl Item for ProjectDiffEditor {
                         h_flex()
                             .gap_1()
                             .child(Icon::new(IconName::XCircle).color(Color::Error))
-                            .child(Label::new(self.project_changes.len().to_string()).color(
+                            .child(Label::new(self.buffer_changes.len().to_string()).color(
                                 if params.selected {
                                     Color::Default
                                 } else {
@@ -363,7 +388,7 @@ impl Item for ProjectDiffEditor {
                         h_flex()
                             .gap_1()
                             .child(Icon::new(IconName::ExclamationTriangle).color(Color::Warning))
-                            .child(Label::new(self.project_changes.len().to_string()).color(
+                            .child(Label::new(self.buffer_changes.len().to_string()).color(
                                 if params.selected {
                                     Color::Default
                                 } else {
@@ -494,7 +519,7 @@ impl Item for ProjectDiffEditor {
 
 impl Render for ProjectDiffEditor {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        let child = if self.project_changes.is_empty() {
+        let child = if self.buffer_changes.is_empty() {
             div()
                 .bg(cx.theme().colors().editor_background)
                 .flex()
