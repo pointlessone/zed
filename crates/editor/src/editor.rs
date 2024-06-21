@@ -528,6 +528,7 @@ pub struct Editor {
     show_inline_completions: bool,
     inlay_hint_cache: InlayHintCache,
     expanded_hunks: ExpandedHunks,
+    keep_hunks_expanded: bool,
     next_inlay_id: usize,
     _subscriptions: Vec<Subscription>,
     pixel_position_of_newest_cursor: Option<gpui::Point<Pixels>>,
@@ -1830,6 +1831,7 @@ impl Editor {
             active_inline_completion: None,
             inlay_hint_cache: InlayHintCache::new(inlay_hint_settings),
             expanded_hunks: ExpandedHunks::default(),
+            keep_hunks_expanded: false,
             gutter_hovered: false,
             pixel_position_of_newest_cursor: None,
             last_bounds: None,
@@ -11031,8 +11033,9 @@ impl Editor {
             multi_buffer::Event::FileHandleChanged | multi_buffer::Event::Reloaded => {
                 cx.emit(EditorEvent::TitleChanged)
             }
-            multi_buffer::Event::DiffBaseChanged => {
+            multi_buffer::Event::DiffBaseChanged { buffer } => {
                 self.scrollbar_marker_state.dirty = true;
+                self.sync_expanded_diff_hunks(buffer.clone(), cx);
                 cx.emit(EditorEvent::DiffBaseChanged);
                 cx.notify();
             }

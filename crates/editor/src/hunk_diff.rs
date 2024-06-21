@@ -112,6 +112,7 @@ impl Editor {
         hunks_to_toggle: Vec<DiffHunk<MultiBufferRow>>,
         cx: &mut ViewContext<Self>,
     ) {
+        let keep_hunks_expanded = self.keep_hunks_expanded;
         let previous_toggle_task = self.expanded_hunks.hunk_update_tasks.remove(&None);
         let new_toggle_task = cx.spawn(move |editor, mut cx| async move {
             if let Some(task) = previous_toggle_task {
@@ -157,7 +158,9 @@ impl Editor {
                                     if hunk_to_toggle_row_range.start > expanded_hunk_row_range.end
                                     {
                                         break;
-                                    } else if expanded_hunk_row_range == hunk_to_toggle_row_range {
+                                    } else if !keep_hunks_expanded
+                                        && expanded_hunk_row_range == hunk_to_toggle_row_range
+                                    {
                                         highlights_to_remove.push(expanded_hunk.hunk_range.clone());
                                         blocks_to_remove.extend(expanded_hunk.block);
                                         hunks_to_toggle.next();
@@ -340,6 +343,9 @@ impl Editor {
     }
 
     pub(super) fn clear_expanded_diff_hunks(&mut self, cx: &mut ViewContext<'_, Editor>) {
+        if self.keep_hunks_expanded {
+            return;
+        }
         self.expanded_hunks.hunk_update_tasks.clear();
         let to_remove = self
             .expanded_hunks
@@ -358,6 +364,7 @@ impl Editor {
     ) {
         let buffer_id = buffer.read(cx).remote_id();
         let buffer_diff_base_version = buffer.read(cx).diff_base_version();
+        let keep_hunks_expanded = self.keep_hunks_expanded;
         self.expanded_hunks
             .hunk_update_tasks
             .remove(&Some(buffer_id));

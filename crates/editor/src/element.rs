@@ -1257,14 +1257,19 @@ impl EditorElement {
             .git
             .git_gutter
             .unwrap_or_default();
-        buffer_snapshot
+        let keep_hunks_expanded = self.editor.read(cx).keep_hunks_expanded;
+        let mut hunks_to_expand = Vec::new();
+        let git_hunk_layout = buffer_snapshot
             .git_diff_hunks_in_range(buffer_start_row..buffer_end_row)
             .map(|hunk| diff_hunk_to_display(&hunk, snapshot))
             .dedup()
             .map(|hunk| match git_gutter_setting {
                 GitGutterSetting::TrackedFiles => {
                     let hitbox = if let DisplayDiffHunk::Unfolded {
-                        display_row_range, ..
+                        diff_base_byte_range,
+                        display_row_range,
+                        multi_buffer_range,
+                        status,
                     } = &hunk
                     {
                         let was_expanded = expanded_hunk_display_rows
@@ -1274,6 +1279,13 @@ impl EditorElement {
                         if was_expanded {
                             None
                         } else {
+                            if keep_hunks_expanded {
+                                hunks_to_expand.push((
+                                    multi_buffer_range.clone(),
+                                    diff_base_byte_range.clone(),
+                                    *status,
+                                ));
+                            }
                             let hunk_bounds = Self::diff_hunk_bounds(
                                 &snapshot,
                                 line_height,
@@ -1289,7 +1301,34 @@ impl EditorElement {
                 }
                 GitGutterSetting::Hide => (hunk, None),
             })
-            .collect()
+            .collect();
+
+        if !hunks_to_expand.is_empty() {
+            self.editor.update(cx, |_, cx| {
+                cx.spawn(|editor, mut cx| async move {
+                    editor
+                        .update(&mut cx, |editor, cx| {
+                            for (multi_buffer_range, diff_base_byte_range, status) in
+                                hunks_to_expand
+                            {
+                                editor.expand_diff_hunk(
+                                    None,
+                                    &HunkToExpand {
+                                        multi_buffer_range,
+                                        diff_base_byte_range,
+                                        status,
+                                    },
+                                    cx,
+                                );
+                            }
+                        })
+                        .ok()
+                })
+                .detach();
+            });
+        }
+
+        git_hunk_layout
     }
 
     #[allow(clippy::too_many_arguments)]

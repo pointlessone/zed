@@ -90,7 +90,9 @@ pub enum Event {
         transaction_id: TransactionId,
     },
     Reloaded,
-    DiffBaseChanged,
+    DiffBaseChanged {
+        buffer: Model<Buffer>,
+    },
     DiffUpdated {
         buffer: Model<Buffer>,
     },
@@ -1641,7 +1643,7 @@ impl MultiBuffer {
             language::Event::Saved => Event::Saved,
             language::Event::FileHandleChanged => Event::FileHandleChanged,
             language::Event::Reloaded => Event::Reloaded,
-            language::Event::DiffBaseChanged => Event::DiffBaseChanged,
+            language::Event::DiffBaseChanged => Event::DiffBaseChanged { buffer },
             language::Event::DiffUpdated => Event::DiffUpdated { buffer },
             language::Event::LanguageChanged => Event::LanguageChanged(buffer.read(cx).remote_id()),
             language::Event::Reparsed => Event::Reparsed(buffer.read(cx).remote_id()),

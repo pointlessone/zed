@@ -5,15 +5,16 @@ use std::{
 };
 
 use anyhow::Context as _;
-use collections::{hash_map, BTreeMap, HashMap};
+use collections::{BTreeMap, HashMap};
 use futures::{stream::FuturesUnordered, StreamExt};
 use git::{diff::DiffHunk, repository::GitFileStatus};
 use gpui::{
     actions, AnyElement, AnyView, AppContext, EventEmitter, FocusHandle, FocusableView,
     InteractiveElement, Model, Render, Subscription, Task, View, WeakModel, WeakView,
 };
+use itertools::Itertools;
 use language::{Buffer, BufferRow, BufferSnapshot};
-use multi_buffer::MultiBuffer;
+use multi_buffer::{ExcerptId, MultiBuffer};
 use project::{Project, ProjectEntryId, ProjectPath, WorktreeId};
 use theme::ActiveTheme;
 use ui::{
@@ -26,7 +27,7 @@ use workspace::{
     ItemNavHistory, Pane, ToolbarItemLocation, Workspace,
 };
 
-use crate::{Editor, EditorEvent, ExpandAllHunkDiffs, DEFAULT_MULTIBUFFER_CONTEXT};
+use crate::{Editor, EditorEvent, DEFAULT_MULTIBUFFER_CONTEXT};
 
 actions!(project_diff, [Deploy]);
 
@@ -108,44 +109,46 @@ impl ProjectDiffEditor {
                 match e {
                     project::Event::WorktreeAdded(id) => {
                         worktree_to_rescan = Some(*id);
-                        project_diff_editor
-                            .buffer_changes
-                            .insert(*id, HashMap::default());
+                        // project_diff_editor
+                        //     .buffer_changes
+                        //     .insert(*id, HashMap::default());
                     }
                     project::Event::WorktreeRemoved(id) => {
                         project_diff_editor.buffer_changes.remove(id);
                     }
                     project::Event::WorktreeUpdatedEntries(id, updated_entries) => {
+                        // TODO kb cannot invalidate buffer entries without invalidating the corresponding excerpts and order entries.
                         worktree_to_rescan = Some(*id);
-                        let entry_changes =
-                            project_diff_editor.buffer_changes.entry(*id).or_default();
-                        for (_, entry_id, change) in updated_entries.iter() {
-                            let changes = entry_changes.entry(*entry_id);
-                            match change {
-                                project::PathChange::Removed => {
-                                    if let hash_map::Entry::Occupied(entry) = changes {
-                                        entry.remove();
-                                    }
-                                }
-                                // TODO kb understand the invalidation case better: now, we do that but still rescan the entire worktree
-                                // What if we already have the buffer loaded inside the diff multi buffer and it was edited there? We should not do anything.
-                                _ => match changes {
-                                    hash_map::Entry::Occupied(mut o) => o.get_mut().invalidate(),
-                                    hash_map::Entry::Vacant(v) => {
-                                        v.insert(ChangedBuffer::NotLoaded);
-                                    }
-                                },
-                            }
-                        }
+                        // let entry_changes =
+                        //     project_diff_editor.buffer_changes.entry(*id).or_default();
+                        // for (_, entry_id, change) in updated_entries.iter() {
+                        //     let changes = entry_changes.entry(*entry_id);
+                        //     match change {
+                        //         project::PathChange::Removed => {
+                        //             if let hash_map::Entry::Occupied(entry) = changes {
+                        //                 entry.remove();
+                        //             }
+                        //         }
+                        //         // TODO kb understand the invalidation case better: now, we do that but still rescan the entire worktree
+                        //         // What if we already have the buffer loaded inside the diff multi buffer and it was edited there? We should not do anything.
+                        //         _ => match changes {
+                        //             hash_map::Entry::Occupied(mut o) => o.get_mut().invalidate(),
+                        //             hash_map::Entry::Vacant(v) => {
+                        //                 v.insert(ChangedBuffer::NotLoaded);
+                        //             }
+                        //         },
+                        //     }
+                        // }
                     }
                     project::Event::WorktreeUpdatedGitRepositories(id) => {
                         worktree_to_rescan = Some(*id);
-                        project_diff_editor.buffer_changes.clear();
+                        // project_diff_editor.buffer_changes.clear();
                     }
                     project::Event::DeletedEntry(id, entry_id) => {
-                        if let Some(entries) = project_diff_editor.buffer_changes.get_mut(id) {
-                            entries.remove(entry_id);
-                        }
+                        worktree_to_rescan = Some(*id);
+                        // if let Some(entries) = project_diff_editor.buffer_changes.get_mut(id) {
+                        //     entries.remove(entry_id);
+                        // }
                     }
                     project::Event::Closed => {
                         project_diff_editor.buffer_changes.clear();
@@ -164,7 +167,10 @@ impl ProjectDiffEditor {
         });
 
         let editor = cx.new_view(|cx| {
-            Editor::for_multibuffer(excerpts.clone(), Some(project.clone()), true, cx)
+            let mut diff_display_editor =
+                Editor::for_multibuffer(excerpts.clone(), Some(project.clone()), true, cx);
+            diff_display_editor.keep_hunks_expanded = true;
+            diff_display_editor
         });
 
         let mut new_self = Self {
@@ -330,9 +336,13 @@ impl ProjectDiffEditor {
         if let Some(current_order) = self.entry_order.get(&worktree_id) {
             let current_entries = self.buffer_changes.entry(worktree_id).or_default();
             let current_excerpts = self.excerpts.read(cx).excerpt_ids();
+            let mut current_excerpt_id = ExcerptId::min();
+            let mut new_order_entries = new_entry_order.iter().peekable().fuse();
+            let mut current_order_entries = current_order.iter().peekable().fuse();
+
             // TODO kb start with current excerpt_id (default MIN), iterate over the old order and compare with new, accumulate excerpt diff first, swap atomically later, below
         } else {
-            let excerpt_updates = new_entry_order.iter().filter_map(|(entry_path, entry_id)| {
+            let excerpts_to_add = new_entry_order.iter().filter_map(|(_, entry_id)| {
                 match new_changes.get(entry_id) {
                     Some(ChangedBuffer::Present(changes))
                     | Some(ChangedBuffer::Invalidated(changes)) => {
@@ -343,7 +353,7 @@ impl ProjectDiffEditor {
                 }
             });
             self.excerpts.update(cx, |multi_buffer, cx| {
-                for (buffer, change_hunks) in excerpt_updates {
+                for (buffer, change_hunks) in excerpts_to_add {
                     multi_buffer.push_excerpts_with_context_lines(
                         buffer,
                         change_hunks
@@ -355,9 +365,8 @@ impl ProjectDiffEditor {
                     );
                 }
             });
-        }
+        };
 
-        ////////////////
         std::mem::swap(
             self.buffer_changes.entry(worktree_id).or_default(),
             &mut new_changes,
@@ -366,9 +375,6 @@ impl ProjectDiffEditor {
             self.entry_order.entry(worktree_id).or_default(),
             &mut new_entry_order,
         );
-        self.editor.update(cx, |editor, cx| {
-            editor.expand_all_hunk_diffs(&ExpandAllHunkDiffs, cx);
-        })
     }
 }
 
