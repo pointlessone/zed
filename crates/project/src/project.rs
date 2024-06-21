@@ -346,7 +346,7 @@ pub enum Event {
     RemoteIdChanged(Option<u64>),
     DisconnectedFromHost,
     Closed,
-    DeletedEntry(ProjectEntryId),
+    DeletedEntry(WorktreeId, ProjectEntryId),
     CollaboratorUpdated {
         old_peer_id: proto::PeerId,
         new_peer_id: proto::PeerId,
@@ -1484,7 +1484,7 @@ impl Project {
         cx: &mut ModelContext<Self>,
     ) -> Option<Task<Result<()>>> {
         let worktree = self.worktree_for_entry(entry_id, cx)?;
-        cx.emit(Event::DeletedEntry(entry_id));
+        cx.emit(Event::DeletedEntry(worktree.read(cx).id(), entry_id));
         worktree.update(cx, |worktree, cx| {
             worktree.delete_entry(entry_id, trash, cx)
         })
@@ -8916,7 +8916,9 @@ impl Project {
             this.worktree_for_entry(entry_id, cx)
                 .ok_or_else(|| anyhow!("worktree not found"))
         })??;
-        this.update(&mut cx, |_, cx| cx.emit(Event::DeletedEntry(entry_id)))?;
+        this.update(&mut cx, |_, cx| {
+            cx.emit(Event::DeletedEntry(worktree.read(cx).id(), entry_id))
+        })?;
         Worktree::handle_delete_entry(worktree, envelope.payload, cx).await
     }
 

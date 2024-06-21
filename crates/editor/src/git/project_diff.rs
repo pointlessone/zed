@@ -1,17 +1,27 @@
-use std::any::{Any, TypeId};
+use std::{
+    any::{Any, TypeId},
+    collections::HashSet,
+    time::Duration,
+};
 
-use collections::HashMap;
+use anyhow::Context as _;
+use collections::{hash_map, HashMap};
+use futures::{stream::FuturesUnordered, StreamExt};
+use git::{diff::DiffHunk, repository::GitFileStatus};
 use gpui::{
     actions, AnyElement, AnyView, AppContext, EventEmitter, FocusHandle, FocusableView,
-    InteractiveElement, Model, Render, Task, View, WeakView,
+    InteractiveElement, Model, Render, Subscription, Task, View, WeakModel, WeakView,
 };
+use language::{Buffer, BufferRow};
 use multi_buffer::MultiBuffer;
 use project::{Project, ProjectEntryId, ProjectPath, WorktreeId};
+use text::Rope;
 use theme::ActiveTheme;
 use ui::{
     div, h_flex, Color, Context, FluentBuilder, Icon, IconName, IntoElement, Label, LabelCommon,
     ParentElement, SharedString, Styled, ViewContext, VisualContext, WindowContext,
 };
+use util::ResultExt;
 use workspace::{
     item::{BreadcrumbText, Item, ItemEvent, ItemHandle, TabContentParams},
     ItemNavHistory, Pane, ToolbarItemLocation, Workspace,
@@ -25,19 +35,47 @@ pub fn init(cx: &mut AppContext) {
     cx.observe_new_views(ProjectDiffEditor::register).detach();
 }
 
+const UPDATE_DEBOUNCE: Duration = Duration::from_millis(80);
+
 struct ProjectDiffEditor {
-    project_changes: HashMap<WorktreeId, HashMap<ProjectEntryId, Changes>>,
+    project_changes: HashMap<WorktreeId, HashMap<ProjectEntryId, ChangedBuffer>>,
+    editor: View<Editor>,
+    excerpts: Model<MultiBuffer>,
+
     project: Model<Project>,
     workspace: WeakView<Workspace>,
     focus_handle: FocusHandle,
-    editor: View<Editor>,
-    excerpts: Model<MultiBuffer>,
+    worktree_rescans: HashMap<WorktreeId, Task<()>>,
+    _subscriptions: Vec<Subscription>,
 }
 
-enum Changes {
+enum ChangedBuffer {
     NotLoaded,
-    Invalidated(Vec<()>),
-    Present(Vec<()>),
+    Invalidated(Changes),
+    Present(Changes),
+}
+
+struct Changes {
+    status: GitFileStatus,
+    buffer: WeakModel<Buffer>,
+    diff_base: Rope,
+    hunks: Vec<DiffHunk<u32>>,
+}
+
+impl ChangedBuffer {
+    fn invalidate(&mut self) {
+        match self {
+            Self::Present(changes) => {
+                *self = Self::Invalidated(Changes {
+                    status: changes.status,
+                    buffer: changes.buffer.clone(),
+                    diff_base: changes.diff_base.clone(),
+                    hunks: std::mem::take(&mut changes.hunks),
+                })
+            }
+            Self::NotLoaded | Self::Invalidated(..) => {}
+        }
+    }
 }
 
 impl ProjectDiffEditor {
@@ -64,8 +102,62 @@ impl ProjectDiffEditor {
         // TODO kb diff change subscriptions + edited subscriptions
         // for that, needed:
         // * `-20/+50` stats retrieval: some background process that reacts on file changes
-        // * workspace change tracking: would project events be enough? WorktreeAdded/Removed/UpdatedEntries/UpdatedGitRepositories?
         let focus_handle = cx.focus_handle();
+        let changed_entries_subscription =
+            cx.subscribe(&project, |project_diff_editor, _, e, cx| {
+                let mut worktree_to_rescan = None;
+                match e {
+                    project::Event::WorktreeAdded(id) => {
+                        worktree_to_rescan = Some(*id);
+                        project_diff_editor
+                            .project_changes
+                            .insert(*id, HashMap::default());
+                    }
+                    project::Event::WorktreeRemoved(id) => {
+                        project_diff_editor.project_changes.remove(id);
+                    }
+                    project::Event::WorktreeUpdatedEntries(id, updated_entries) => {
+                        worktree_to_rescan = Some(*id);
+                        let entry_changes =
+                            project_diff_editor.project_changes.entry(*id).or_default();
+                        for (_, entry_id, change) in updated_entries.iter() {
+                            let changes = entry_changes.entry(*entry_id);
+                            match change {
+                                project::PathChange::Removed => {
+                                    if let hash_map::Entry::Occupied(entry) = changes {
+                                        entry.remove();
+                                    }
+                                }
+                                // TODO kb understand the invalidation case better: now, we do that but still rescan the entire worktree
+                                // What if we already have the buffer loaded inside the diff multi buffer and it was edited there? We should not do anything.
+                                _ => match changes {
+                                    hash_map::Entry::Occupied(mut o) => o.get_mut().invalidate(),
+                                    hash_map::Entry::Vacant(v) => {
+                                        v.insert(ChangedBuffer::NotLoaded);
+                                    }
+                                },
+                            }
+                        }
+                    }
+                    project::Event::WorktreeUpdatedGitRepositories(id) => {
+                        worktree_to_rescan = Some(*id);
+                        project_diff_editor.project_changes.clear();
+                    }
+                    project::Event::DeletedEntry(id, entry_id) => {
+                        if let Some(entries) = project_diff_editor.project_changes.get_mut(id) {
+                            entries.remove(entry_id);
+                        }
+                    }
+                    project::Event::Closed => {
+                        project_diff_editor.project_changes.clear();
+                    }
+                    _ => {}
+                }
+
+                if let Some(worktree_to_rescan) = worktree_to_rescan {
+                    project_diff_editor.schedule_worktree_rescan(worktree_to_rescan, cx);
+                }
+            });
 
         let excerpts = cx.new_model(|cx| {
             let project = project.read(cx);
@@ -76,14 +168,139 @@ impl ProjectDiffEditor {
             Editor::for_multibuffer(excerpts.clone(), Some(project.clone()), true, cx)
         });
 
-        Self {
+        let mut new_self = Self {
             project,
             workspace,
             project_changes: HashMap::default(),
+            worktree_rescans: HashMap::default(),
             focus_handle,
             editor,
             excerpts,
+            _subscriptions: vec![changed_entries_subscription],
+        };
+        new_self.schedule_rescan_all(cx);
+        new_self
+    }
+
+    fn schedule_rescan_all(&mut self, cx: &mut ViewContext<Self>) {
+        for worktree in self.project.read(cx).worktrees() {
+            self.schedule_worktree_rescan(worktree.read(cx).id(), cx);
         }
+    }
+
+    fn schedule_worktree_rescan(&mut self, id: WorktreeId, cx: &mut ViewContext<Self>) {
+        let project = self.project.clone();
+        self.worktree_rescans.insert(
+            id,
+            cx.spawn(|project_diff_editor, mut cx| async move {
+                cx.background_executor().timer(UPDATE_DEBOUNCE).await;
+                let open_tasks = project
+                    .update(&mut cx, |project, cx| {
+                        let worktree = project.worktree_for_id(id, cx)?;
+                        let applicable_entries = worktree
+                            .read(cx)
+                            .entries(false, 0)
+                            .filter(|entry| !entry.is_external)
+                            .filter(|entry| entry.is_file() || entry.is_symlink)
+                            .filter_map(|entry| Some((entry.git_status?, entry)))
+                            .filter_map(|(git_status, entry)| {
+                                Some((git_status, entry.id, project.path_for_entry(entry.id, cx)?))
+                            })
+                            .collect::<Vec<_>>();
+                        Some(
+                            applicable_entries
+                                .into_iter()
+                                .map(|(status, entry_id, entry_path)| {
+                                    let open_task = project.open_path(entry_path.clone(), cx);
+                                    (status, entry_id, entry_path, open_task)
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                    })
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let buffers_with_git_diff = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let mut open_tasks = open_tasks
+                            .into_iter()
+                            .map(|(status, entry_id, entry_path, open_task)| async move {
+                                let (_, opened_model) = open_task.await.with_context(|| {
+                                    format!(
+                                        "loading buffer {} for git diff",
+                                        entry_path.path.display()
+                                    )
+                                })?;
+                                let buffer = match opened_model.downcast::<Buffer>() {
+                                    Ok(buffer) => buffer,
+                                    Err(_model) => anyhow::bail!(
+                                        "Could not load {} as a buffer for git diff",
+                                        entry_path.path.display()
+                                    ),
+                                };
+                                anyhow::Ok((status, entry_id, entry_path, buffer))
+                            })
+                            .collect::<FuturesUnordered<_>>();
+
+                        let mut buffers_with_git_diff = Vec::new();
+                        while let Some(opened_buffer) = open_tasks.next().await {
+                            if let Some(opened_buffer) = opened_buffer.log_err() {
+                                buffers_with_git_diff.push(opened_buffer);
+                            }
+                        }
+                        buffers_with_git_diff
+                    })
+                    .await;
+
+                project_diff_editor
+                    .update(&mut cx, |project_diff_editor, cx| {
+                        let mut new_changes =
+                            HashMap::<WorktreeId, HashSet<ProjectEntryId>>::default();
+                        for (status, entry_id, entry_path, buffer) in buffers_with_git_diff {
+                            let Some(diff_base) = buffer.read(cx).diff_base().cloned() else {
+                                continue;
+                            };
+                            new_changes
+                                .entry(entry_path.worktree_id)
+                                .or_default()
+                                .insert(entry_id);
+                            // TODO kb should move off to a background task?
+                            let hunks = buffer
+                                .read(cx)
+                                .snapshot()
+                                .git_diff_hunks_in_row_range(0..BufferRow::MAX)
+                                .collect::<Vec<_>>();
+                            project_diff_editor
+                                .project_changes
+                                .entry(entry_path.worktree_id)
+                                .or_default()
+                                .insert(
+                                    entry_id,
+                                    ChangedBuffer::Present(Changes {
+                                        status,
+                                        buffer: buffer.downgrade(),
+                                        diff_base,
+                                        hunks,
+                                    }),
+                                );
+                        }
+
+                        project_diff_editor
+                            .project_changes
+                            .retain(|worktree_id, changes| {
+                                let Some(new_changes) = new_changes.get(worktree_id) else {
+                                    return false;
+                                };
+                                changes.retain(|entry_id, _| new_changes.contains(entry_id));
+                                !changes.is_empty()
+                            });
+
+                        // TODO kb now, update the excerpts
+                    })
+                    .ok();
+            }),
+        );
     }
 }
 
