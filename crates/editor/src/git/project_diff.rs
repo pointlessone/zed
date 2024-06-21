@@ -1,5 +1,6 @@
 use std::{
     any::{Any, TypeId},
+    collections::HashSet,
     time::Duration,
 };
 
@@ -14,7 +15,6 @@ use gpui::{
 use language::{Buffer, BufferRow, BufferSnapshot};
 use multi_buffer::MultiBuffer;
 use project::{Project, ProjectEntryId, ProjectPath, WorktreeId};
-use text::Rope;
 use theme::ActiveTheme;
 use ui::{
     div, h_flex, Color, Context, FluentBuilder, Icon, IconName, IntoElement, Label, LabelCommon,
@@ -26,7 +26,7 @@ use workspace::{
     ItemNavHistory, Pane, ToolbarItemLocation, Workspace,
 };
 
-use crate::{Editor, EditorEvent};
+use crate::{Editor, EditorEvent, ExpandAllHunkDiffs, DEFAULT_MULTIBUFFER_CONTEXT};
 
 actions!(project_diff, [Deploy]);
 
@@ -51,6 +51,7 @@ struct ProjectDiffEditor {
 
 enum ChangedBuffer {
     NotLoaded,
+    // TODO kb is it needed?
     Invalidated(Changes),
     Present(Changes),
 }
@@ -58,8 +59,7 @@ enum ChangedBuffer {
 struct Changes {
     status: GitFileStatus,
     buffer: WeakModel<Buffer>,
-    diff_base: Rope,
-    hunks: Vec<DiffHunk<u32>>,
+    hunks: Vec<DiffHunk<BufferRow>>,
 }
 
 impl ChangedBuffer {
@@ -69,7 +69,6 @@ impl ChangedBuffer {
                 *self = Self::Invalidated(Changes {
                     status: changes.status,
                     buffer: changes.buffer.clone(),
-                    diff_base: changes.diff_base.clone(),
                     hunks: std::mem::take(&mut changes.hunks),
                 })
             }
@@ -184,9 +183,19 @@ impl ProjectDiffEditor {
     }
 
     fn schedule_rescan_all(&mut self, cx: &mut ViewContext<Self>) {
+        let mut current_worktrees = HashSet::<WorktreeId>::default();
         for worktree in self.project.read(cx).worktrees().collect::<Vec<_>>() {
-            self.schedule_worktree_rescan(worktree.read(cx).id(), cx);
+            let worktree_id = worktree.read(cx).id();
+            current_worktrees.insert(worktree_id);
+            self.schedule_worktree_rescan(worktree_id, cx);
         }
+
+        self.worktree_rescans
+            .retain(|worktree_id, _| current_worktrees.contains(worktree_id));
+        self.buffer_changes
+            .retain(|worktree_id, _| current_worktrees.contains(worktree_id));
+        self.entry_order
+            .retain(|worktree_id, _| current_worktrees.contains(worktree_id));
     }
 
     fn schedule_worktree_rescan(&mut self, id: WorktreeId, cx: &mut ViewContext<Self>) {
@@ -256,26 +265,15 @@ impl ProjectDiffEditor {
 
                 let Some((buffers, mut new_entries)) = cx
                     .update(|cx| {
-                        let mut buffers = BTreeMap::<
-                            WorktreeId,
-                            HashMap<
-                                ProjectEntryId,
-                                (GitFileStatus, Rope, WeakModel<Buffer>, BufferSnapshot),
-                            >,
-                        >::new();
+                        let mut buffers = HashMap::<
+                            ProjectEntryId,
+                            (GitFileStatus, WeakModel<Buffer>, BufferSnapshot),
+                        >::default();
                         let mut new_entries = Vec::new();
                         for (status, entry_id, entry_path, buffer) in buffers_with_git_diff {
-                            let Some(diff_base) = buffer.read(cx).diff_base().cloned() else {
-                                continue;
-                            };
-                            buffers.entry(entry_path.worktree_id).or_default().insert(
+                            buffers.insert(
                                 entry_id,
-                                (
-                                    status,
-                                    diff_base,
-                                    buffer.downgrade(),
-                                    buffer.read(cx).snapshot(),
-                                ),
+                                (status, buffer.downgrade(), buffer.read(cx).snapshot()),
                             );
                             new_entries.push((entry_path, entry_id));
                         }
@@ -289,24 +287,18 @@ impl ProjectDiffEditor {
                 let (new_changes, new_entry_order) = cx
                     .background_executor()
                     .spawn(async move {
-                        let mut new_changes =
-                            BTreeMap::<WorktreeId, HashMap<ProjectEntryId, ChangedBuffer>>::new();
-                        for (worktree_id, worktree_buffers) in buffers {
-                            for (entry_id, (status, diff_base, buffer, buffer_snapshot)) in
-                                worktree_buffers
-                            {
-                                new_changes.entry(worktree_id).or_default().insert(
-                                    entry_id,
-                                    ChangedBuffer::Present(Changes {
-                                        status,
-                                        diff_base,
-                                        buffer,
-                                        hunks: buffer_snapshot
-                                            .git_diff_hunks_in_row_range(0..BufferRow::MAX)
-                                            .collect::<Vec<_>>(),
-                                    }),
-                                );
-                            }
+                        let mut new_changes = HashMap::<ProjectEntryId, ChangedBuffer>::default();
+                        for (entry_id, (status, buffer, buffer_snapshot)) in buffers {
+                            new_changes.insert(
+                                entry_id,
+                                ChangedBuffer::Present(Changes {
+                                    status,
+                                    buffer,
+                                    hunks: buffer_snapshot
+                                        .git_diff_hunks_in_row_range(0..BufferRow::MAX)
+                                        .collect::<Vec<_>>(),
+                                }),
+                            );
                         }
 
                         new_entries.sort_by(|(project_path_a, _), (project_path_b, _)| {
@@ -321,11 +313,62 @@ impl ProjectDiffEditor {
 
                 project_diff_editor
                     .update(&mut cx, |project_diff_editor, cx| {
-                        // TODO kb now, update the excerpts
+                        project_diff_editor.update_excerpts(id, new_changes, new_entry_order, cx);
                     })
                     .ok();
             }),
         );
+    }
+
+    fn update_excerpts(
+        &mut self,
+        worktree_id: WorktreeId,
+        mut new_changes: HashMap<ProjectEntryId, ChangedBuffer>,
+        mut new_entry_order: Vec<(ProjectPath, ProjectEntryId)>,
+        cx: &mut ViewContext<ProjectDiffEditor>,
+    ) {
+        if let Some(current_order) = self.entry_order.get(&worktree_id) {
+            let current_entries = self.buffer_changes.entry(worktree_id).or_default();
+            let current_excerpts = self.excerpts.read(cx).excerpt_ids();
+            // TODO kb start with current excerpt_id (default MIN), iterate over the old order and compare with new, accumulate excerpt diff first, swap atomically later, below
+        } else {
+            let excerpt_updates = new_entry_order.iter().filter_map(|(entry_path, entry_id)| {
+                match new_changes.get(entry_id) {
+                    Some(ChangedBuffer::Present(changes))
+                    | Some(ChangedBuffer::Invalidated(changes)) => {
+                        let buffer = changes.buffer.upgrade()?;
+                        Some((buffer, &changes.hunks))
+                    }
+                    Some(ChangedBuffer::NotLoaded) | None => None,
+                }
+            });
+            self.excerpts.update(cx, |multi_buffer, cx| {
+                for (buffer, change_hunks) in excerpt_updates {
+                    multi_buffer.push_excerpts_with_context_lines(
+                        buffer,
+                        change_hunks
+                            .iter()
+                            .map(|hunk| hunk.buffer_range.clone())
+                            .collect(),
+                        DEFAULT_MULTIBUFFER_CONTEXT,
+                        cx,
+                    );
+                }
+            });
+        }
+
+        ////////////////
+        std::mem::swap(
+            self.buffer_changes.entry(worktree_id).or_default(),
+            &mut new_changes,
+        );
+        std::mem::swap(
+            self.entry_order.entry(worktree_id).or_default(),
+            &mut new_entry_order,
+        );
+        self.editor.update(cx, |editor, cx| {
+            editor.expand_all_hunk_diffs(&ExpandAllHunkDiffs, cx);
+        })
     }
 }
 
