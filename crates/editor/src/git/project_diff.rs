@@ -10,9 +10,8 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use git::{diff::DiffHunk, repository::GitFileStatus};
 use gpui::{
     actions, AnyElement, AnyView, AppContext, EventEmitter, FocusHandle, FocusableView,
-    InteractiveElement, Model, Render, Subscription, Task, View, WeakModel, WeakView,
+    InteractiveElement, Model, Render, Subscription, Task, View, WeakView,
 };
-use itertools::Itertools;
 use language::{Buffer, BufferRow, BufferSnapshot};
 use multi_buffer::{ExcerptId, MultiBuffer};
 use project::{Project, ProjectEntryId, ProjectPath, WorktreeId};
@@ -38,7 +37,7 @@ pub fn init(cx: &mut AppContext) {
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(80);
 
 struct ProjectDiffEditor {
-    buffer_changes: BTreeMap<WorktreeId, HashMap<ProjectEntryId, ChangedBuffer>>,
+    buffer_changes: BTreeMap<WorktreeId, HashMap<ProjectEntryId, Changes>>,
     entry_order: HashMap<WorktreeId, Vec<(ProjectPath, ProjectEntryId)>>,
     excerpts: Model<MultiBuffer>,
     editor: View<Editor>,
@@ -50,32 +49,10 @@ struct ProjectDiffEditor {
     _subscriptions: Vec<Subscription>,
 }
 
-enum ChangedBuffer {
-    NotLoaded,
-    // TODO kb is it needed?
-    Invalidated(Changes),
-    Present(Changes),
-}
-
 struct Changes {
     status: GitFileStatus,
-    buffer: WeakModel<Buffer>,
+    buffer: Model<Buffer>,
     hunks: Vec<DiffHunk<BufferRow>>,
-}
-
-impl ChangedBuffer {
-    fn invalidate(&mut self) {
-        match self {
-            Self::Present(changes) => {
-                *self = Self::Invalidated(Changes {
-                    status: changes.status,
-                    buffer: changes.buffer.clone(),
-                    hunks: std::mem::take(&mut changes.hunks),
-                })
-            }
-            Self::NotLoaded | Self::Invalidated(..) => {}
-        }
-    }
 }
 
 impl ProjectDiffEditor {
@@ -134,7 +111,7 @@ impl ProjectDiffEditor {
                         //         _ => match changes {
                         //             hash_map::Entry::Occupied(mut o) => o.get_mut().invalidate(),
                         //             hash_map::Entry::Vacant(v) => {
-                        //                 v.insert(ChangedBuffer::NotLoaded);
+                        //                 v.insert(None);
                         //             }
                         //         },
                         //     }
@@ -273,14 +250,12 @@ impl ProjectDiffEditor {
                     .update(|cx| {
                         let mut buffers = HashMap::<
                             ProjectEntryId,
-                            (GitFileStatus, WeakModel<Buffer>, BufferSnapshot),
+                            (GitFileStatus, Model<Buffer>, BufferSnapshot),
                         >::default();
                         let mut new_entries = Vec::new();
                         for (status, entry_id, entry_path, buffer) in buffers_with_git_diff {
-                            buffers.insert(
-                                entry_id,
-                                (status, buffer.downgrade(), buffer.read(cx).snapshot()),
-                            );
+                            let buffer_snapshot = buffer.read(cx).snapshot();
+                            buffers.insert(entry_id, (status, buffer, buffer_snapshot));
                             new_entries.push((entry_path, entry_id));
                         }
                         (buffers, new_entries)
@@ -293,17 +268,17 @@ impl ProjectDiffEditor {
                 let (new_changes, new_entry_order) = cx
                     .background_executor()
                     .spawn(async move {
-                        let mut new_changes = HashMap::<ProjectEntryId, ChangedBuffer>::default();
+                        let mut new_changes = HashMap::<ProjectEntryId, Changes>::default();
                         for (entry_id, (status, buffer, buffer_snapshot)) in buffers {
                             new_changes.insert(
                                 entry_id,
-                                ChangedBuffer::Present(Changes {
+                                Changes {
                                     status,
                                     buffer,
                                     hunks: buffer_snapshot
                                         .git_diff_hunks_in_row_range(0..BufferRow::MAX)
                                         .collect::<Vec<_>>(),
-                                }),
+                                },
                             );
                         }
 
@@ -329,7 +304,7 @@ impl ProjectDiffEditor {
     fn update_excerpts(
         &mut self,
         worktree_id: WorktreeId,
-        mut new_changes: HashMap<ProjectEntryId, ChangedBuffer>,
+        mut new_changes: HashMap<ProjectEntryId, Changes>,
         mut new_entry_order: Vec<(ProjectPath, ProjectEntryId)>,
         cx: &mut ViewContext<ProjectDiffEditor>,
     ) {
@@ -342,21 +317,15 @@ impl ProjectDiffEditor {
 
             // TODO kb start with current excerpt_id (default MIN), iterate over the old order and compare with new, accumulate excerpt diff first, swap atomically later, below
         } else {
-            let excerpts_to_add = new_entry_order.iter().filter_map(|(_, entry_id)| {
-                match new_changes.get(entry_id) {
-                    Some(ChangedBuffer::Present(changes))
-                    | Some(ChangedBuffer::Invalidated(changes)) => {
-                        let buffer = changes.buffer.upgrade()?;
-                        Some((buffer, &changes.hunks))
-                    }
-                    Some(ChangedBuffer::NotLoaded) | None => None,
-                }
-            });
             self.excerpts.update(cx, |multi_buffer, cx| {
-                for (buffer, change_hunks) in excerpts_to_add {
+                for new_changes in new_entry_order
+                    .iter()
+                    .filter_map(|(_, entry_id)| new_changes.get(entry_id))
+                {
                     multi_buffer.push_excerpts_with_context_lines(
-                        buffer,
-                        change_hunks
+                        new_changes.buffer.clone(),
+                        new_changes
+                            .hunks
                             .iter()
                             .map(|hunk| hunk.buffer_range.clone())
                             .collect(),
