@@ -364,7 +364,6 @@ impl Editor {
     ) {
         let buffer_id = buffer.read(cx).remote_id();
         let buffer_diff_base_version = buffer.read(cx).diff_base_version();
-        let keep_hunks_expanded = self.keep_hunks_expanded;
         self.expanded_hunks
             .hunk_update_tasks
             .remove(&Some(buffer_id));
